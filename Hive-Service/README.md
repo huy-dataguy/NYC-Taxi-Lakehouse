@@ -9,11 +9,20 @@ The Hive Metastore is a central repository that stores metadata about tables, sc
 ## Architecture
 
 ```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Spark SQL     │    │  Hive Metastore │    │     MySQL       │
-│   (Client)      │───▶│    Service      │───▶│   (Backend)     │
-│                 │    │   Port: 9083    │    │   Port: 3306    │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
+         Docker Network: data_network
+    ┌────────────────────────────────────────────────────────────┐
+    │                                                            │
+    │  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐  │
+    │  │   Spark Client  │    │  Hive Metastore │    │     MySQL       │  │
+    │  │ (quochuy-client)│───▶│   (hive-service)│───▶│    (mysql)      │  │
+    │  │                 │    │   Port: 9083    │    │   Port: 3306    │  │
+    │  └─────────────────┘    └─────────────────┘    └─────────────────┘  │
+    │           │                                                        │
+    │           │              ┌─────────────────┐                       │
+    │           └─────────────▶│ Trino Connector │                       │
+    │                          │ (query engine)  │                       │
+    │                          └─────────────────┘                       │
+    └────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Components
@@ -80,30 +89,114 @@ docker logs hive-service
 
 # Check MySQL logs
 docker logs mysql
-
-# Test connection from Spark (example)
-docker exec -it spark-client spark-sql \
-  --conf spark.sql.hive.metastore.uris=thrift://hive-service:9083
 ```
 
 ### 3. Connect from Spark Applications
-When configuring Spark to use this Hive Metastore:
+Spark applications connect to the Hive Metastore through the Docker network. The connection is configured in `spark-defaults.conf`:
+
+```properties
+# In spark-defaults.conf
+spark.sql.catalogImplementation=hive
+spark.hadoop.hive.metastore.uris=thrift://hive-service:9083
+```
+
+When configuring Spark programmatically:
 
 ```python
 spark = SparkSession.builder \
     .appName("Your App") \
     .enableHiveSupport() \
-    .config("hive.metastore.uris", "thrift://hive-service:9083") \
+    .config("spark.sql.catalogImplementation", "hive") \
+    .config("spark.hadoop.hive.metastore.uris", "thrift://hive-service:9083") \
     .getOrCreate()
+```
+
+### 4. Test Connection from Spark Container
+```bash
+# Access the Spark client container
+docker exec -it client bash
+
+# Switch to hadoop user and test Spark SQL
+su - hadoopquochuy
+spark-sql
+
+# In Spark SQL shell, test metastore connection:
+# SHOW DATABASES;
+# SHOW TABLES IN gold;
 ```
 
 ## Integration with Project
 
 This Hive Metastore service is used by:
 
-1. **Spark Applications**: For registering and querying Delta tables
-2. **Table Registration Scripts**: Like `register_delta_tables.py` in the Spark-on-YARN module
-3. **BI Tools**: For schema discovery and SQL querying
+1. **Spark Applications**: Connected via `thrift://hive-service:9083` in the `data_network`
+   - Spark configuration in `Spark-on-YARN/config/client/config/spark-defaults.conf` 
+   - Table registration scripts like `register_delta_tables.py`
+   - Data processing pipelines (bronze, silver, gold layers)
+
+2. **Trino Query Engine**: All Trino workers connect via `delta.properties` catalog configuration
+   - Coordinator and workers use `hive.metastore.uri=thrift://hive-service:9083`
+   - Enables cross-engine querying of the same tables
+
+3. **Data Pipeline Components**:
+   - **MinIO/S3**: Storage layer for Delta Lake files (referenced in table locations)
+   - **HDFS**: Alternative storage for data files
+   - **Airflow**: Orchestrates table registration and maintenance tasks
+
+### Network Communication
+All components communicate through the `data_network` Docker bridge network:
+- Container hostnames are used as connection addresses
+- No external network configuration required
+- Services discover each other by container name
+
+## Project Workflow Integration
+
+### Data Pipeline Flow
+The Hive Metastore plays a central role in the NYC Taxi Lakehouse project's medallion architecture:
+
+1. **Data Ingestion** (Kafka + Airflow)
+   - Raw taxi data is streamed through Kafka topics
+   - Airflow orchestrates the ingestion pipeline
+
+2. **Bronze Layer** (Raw Data)
+   - Spark Streaming consumers read from Kafka
+   - Raw data is stored in MinIO/S3 or HDFS
+   - Minimal schema enforcement
+
+3. **Silver Layer** (Cleaned Data)
+   - Spark batch jobs process bronze data
+   - Data cleaning, validation, and transformation
+   - Tables registered in Hive Metastore via `register_delta_tables.py`
+
+4. **Gold Layer** (Business Logic)
+   - Aggregated and business-ready datasets
+   - Optimized for analytics and reporting
+   - All tables accessible through Hive Metastore
+
+### Table Registration Process
+```python
+# Example from register_delta_tables.py
+tables = [
+    ("silver", "fhvhv_main", "s3a://deltalake/silver/fhvhv_main"),
+    ("gold", "fhvhv_trips", "s3a://deltalake/gold/fhvhv_trips"),
+    ("gold", "fhvhv_zones", "s3a://deltalake/gold/fhvhv_zones"),
+    # ... more tables
+]
+
+for db, tbl, path in tables:
+    spark.sql(f"""
+        CREATE TABLE IF NOT EXISTS {db}.{tbl}
+        USING DELTA
+        LOCATION '{path}'
+    """)
+```
+
+### Cross-Engine Compatibility
+Once tables are registered in Hive Metastore:
+- **Spark SQL**: Direct SQL queries and DataFrame operations
+- **Trino**: High-performance distributed queries
+- **Superset**: BI dashboards and visualizations
+- **External Tools**: Any Hive-compatible query engine
 
 ## Common Operations
 
@@ -138,15 +231,35 @@ docker exec -it hive-service schematool -dbType mysql -upgradeSchema
 
 #### Connection Issues
 - Ensure `data_network` exists: `docker network create data_network`
-- Check port conflicts: `netstat -an | grep 3307`
+- Check all services are on the same network: `docker network inspect data_network`
 - Verify firewall settings for ports 3307 and 9083
+- Check container connectivity: `docker exec -it client ping hive-service`
 
 ## Network Configuration
 
-The service uses the `data_network` bridge network, which should be shared with other components:
-- Spark cluster (for metadata access)
-- Any BI tools or query engines
-- Data processing applications
+The service uses the `data_network` bridge network, which is shared across all project components:
+
+### Connected Services
+- **Spark Cluster**: `client`, `master-huy`, `worker-huy1`, `worker-huy2` containers
+- **Trino Query Engine**: `trino-coordinator`, `trino-worker-1`, `trino-worker-2`, `trino-worker-3`
+- **MinIO Storage**: `minio1`, `minio2`, `minio3` containers
+- **Kafka & Airflow**: `broker`, `zookeeper`, `airflow-webserver`, `airflow-scheduler`
+- **Superset**: `superset` container for visualization
+
+### Network Features
+- **Service Discovery**: Containers communicate using hostnames (e.g., `hive-service:9083`)
+- **External Network**: The `data_network` is marked as external and shared across compose files
+- **Port Mapping**: Only necessary ports are exposed to host system
+- **Internal Communication**: All inter-service communication happens within the Docker network
+
+### Network Creation
+```bash
+# Create the shared network (if not exists)
+docker network create data_network
+
+# Verify network exists
+docker network ls | grep data_network
+```
 
 ## Data Persistence
 
