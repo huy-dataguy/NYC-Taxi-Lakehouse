@@ -18,7 +18,7 @@
     - Determine peak hours for shared ride requests.
 
 ### Data
-- **Primary Data**: `fhvhv_tripdata_2019-04.parquet` from NYC TLC, contain over 20 million trip records with detail info like timestamps, locations, fares, and tips.
+- **Primary Data**: `fhvhv_tripdata_2019-04.parquet` New York City Taxi and Limousine Commission with detail info like timestamps, locations, fares, and tips.
 - **Lookup Data**: `taxi_zone_lookup.csv`, used to map location IDs (PULocationID, DOLocationID) to geographical names for regional analysis.
 
 ### Architecture
